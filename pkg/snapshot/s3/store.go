@@ -92,6 +92,10 @@ func NewStore(logger logr.Logger) *ObjectStore {
 }
 
 func (o *ObjectStore) Init(config *snapshotapi.S3Options) error {
+	if err := checkTags(config.Tagging); err != nil {
+		return errors.Wrap(err, "invalid tagging")
+	}
+
 	if config.AccessKeyID != "" {
 		_ = os.Setenv("AWS_ACCESS_KEY_ID", config.AccessKeyID)
 	}
@@ -182,6 +186,32 @@ func validChecksumAlg(alg string) bool {
 	return alg == "" || slices.Contains(typedAlg.Values(), typedAlg)
 }
 
+// checkTags validates an S3 object tagging string of the form
+// "k1=v1&k2=v2". AWS limits objects to 10 tags; keys to 128 unicode
+// characters; values to 256.
+func checkTags(tagging string) error {
+	if tagging == "" {
+		return nil
+	}
+	tags := strings.Split(tagging, "&")
+	if len(tags) > 10 {
+		return errors.New("S3 allows at most 10 tags per object")
+	}
+	for _, t := range tags {
+		k, v, ok := strings.Cut(t, "=")
+		if !ok || k == "" {
+			return errors.Errorf("invalid tag %q: expected key=value", t)
+		}
+		if len([]rune(k)) > 128 {
+			return errors.Errorf("tag key %q exceeds 128 unicode characters", k)
+		}
+		if len([]rune(v)) > 256 {
+			return errors.Errorf("tag value for key %q exceeds 256 unicode characters", k)
+		}
+	}
+	return nil
+}
+
 func readCustomerKey(customerKeyEncryptionFile string) (string, error) {
 	if _, err := os.Stat(customerKeyEncryptionFile); err != nil {
 		if os.IsNotExist(err) {
@@ -215,6 +245,12 @@ func (o *ObjectStore) Target() string {
 }
 
 func (o *ObjectStore) PutObject(ctx context.Context, body io.Reader) error {
+	input := o.newPutObjectInput(ctx, body)
+	_, err := o.s3Uploader.Upload(ctx, input)
+	return errors.Wrapf(err, "error putting object %s", o.key)
+}
+
+func (o *ObjectStore) newPutObjectInput(ctx context.Context, body io.Reader) *s3.PutObjectInput {
 	input := &s3.PutObjectInput{
 		Bucket: aws.String(o.bucket),
 		Key:    aws.String(o.key),
@@ -247,8 +283,7 @@ func (o *ObjectStore) PutObject(ctx context.Context, body io.Reader) error {
 		input.ChecksumAlgorithm = s3types.ChecksumAlgorithm(o.checksumAlg)
 	}
 
-	_, err := o.s3Uploader.Upload(ctx, input)
-	return errors.Wrapf(err, "error putting object %s", o.key)
+	return input
 }
 
 func (o *ObjectStore) GetObject(ctx context.Context) (io.ReadCloser, error) {
